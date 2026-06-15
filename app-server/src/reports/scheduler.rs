@@ -96,12 +96,13 @@ async fn check_and_enqueue(
         now
     );
 
-    let _ = cache
-        .insert(REPORT_SCHEDULER_LAST_CHECK_CACHE_KEY, now.timestamp())
-        .await;
-
     let hours_to_check = hour_boundaries_between(last_check, now);
     if hours_to_check.is_empty() {
+        // No full hour elapsed; nothing to enqueue. Advance the checkpoint so it
+        // tracks forward across sub-hour gaps without losing any bucket.
+        let _ = cache
+            .insert(REPORT_SCHEDULER_LAST_CHECK_CACHE_KEY, now.timestamp())
+            .await;
         return Ok(());
     }
     log::info!(
@@ -110,8 +111,24 @@ async fn check_and_enqueue(
         hours_to_check
     );
 
-    for (weekday, hour, triggered_at) in hours_to_check {
-        let reports = get_reports_for_weekday_and_hour(pool, weekday, hour).await?;
+    // Advance the checkpoint only across hour buckets that were fully enqueued.
+    // On the first failure (DB fetch or enqueue) we stop and leave the checkpoint
+    // at the last completed bucket, so the failed bucket and everything after it
+    // are retried on the next cycle instead of being silently skipped.
+    let mut last_completed_ts: Option<i64> = None;
+    'outer: for (weekday, hour, triggered_at) in hours_to_check {
+        let reports = match get_reports_for_weekday_and_hour(pool, weekday, hour).await {
+            Ok(reports) => reports,
+            Err(e) => {
+                log::error!(
+                    "[Reports Scheduler] Failed to fetch reports for weekday {} hour {}: {:?}; will retry next cycle",
+                    weekday,
+                    hour,
+                    e
+                );
+                break;
+            }
+        };
 
         for report in reports {
             let message = ReportTriggerMessage {
@@ -125,12 +142,21 @@ async fn check_and_enqueue(
 
             if let Err(e) = push_to_reports_queue(message, queue.clone()).await {
                 log::error!(
-                    "[Reports Scheduler] Failed to enqueue report {}: {:?}",
+                    "[Reports Scheduler] Failed to enqueue report {}: {:?}; will retry this bucket next cycle",
                     report.id,
                     e
                 );
+                break 'outer;
             }
         }
+
+        last_completed_ts = Some(triggered_at);
+    }
+
+    if let Some(ts) = last_completed_ts {
+        let _ = cache
+            .insert(REPORT_SCHEDULER_LAST_CHECK_CACHE_KEY, ts)
+            .await;
     }
 
     Ok(())
